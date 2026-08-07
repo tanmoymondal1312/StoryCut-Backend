@@ -40,6 +40,20 @@ class StopRequested(Exception):
     pass
 
 
+class RateLimitedError(Exception):
+    pass
+
+
+class AiErrorResponse(Exception):
+    pass
+
+
+TOLERANT_HINT = ("\n\nIf the transcript is too noisy to understand, still return your best"
+                 " guess of 1-3 likely highlight intervals from the timestamps."
+                 " NEVER respond with an error object, explanation, or any text."
+                 " ONLY return the JSON object with the clips array.")
+
+
 class FreeModelCombo(ctk.CTkComboBox):
     """CTkComboBox that live-fetches OpenRouter free models every time
     the dropdown is opened (no hardcoded list)."""
@@ -293,6 +307,11 @@ class App:
         self.console.tag_config("info", foreground="#dde6f5")
         self.console.tag_config("success", foreground="#7ddb9a")
         self.console.tag_config("error", foreground="#ff8080")
+        self.log_path = "app.log"
+        try:
+            open(self.log_path, "w", encoding="utf-8").close()
+        except OSError:
+            pass
         self.console.insert("end", "Ready.  Load a video and press Start.\n", "info")
         self.console.configure(state="disabled")
 
@@ -399,7 +418,13 @@ class App:
         self.root.after(100, self._poll_queue)
 
     def log(self, message, level="info"):
-        self.msg_queue.put((message, level, time.strftime("%H:%M:%S")))
+        ts = time.strftime("%H:%M:%S")
+        self.msg_queue.put((message, level, ts))
+        try:
+            with open("app.log", "a", encoding="utf-8") as f:
+                f.write(f"[{ts}] [{level.upper():7}] {message}\n")
+        except OSError:
+            pass
 
     # ----------------------------------------------------------------
     # Pipeline
@@ -460,23 +485,40 @@ class App:
 
         language = self.language.get().strip() or None
         self.log("Transcribing…  (this can take a while)", "info")
-        kwargs = {"language": language} if language else {}
-        result = model.transcribe(self.video_path.get(), beam_size=5, task="transcribe", **kwargs)
+        kwargs = {
+            "language": language,
+            "beam_size": 5,
+            "task": "transcribe",
+            "vad_filter": True,
+            "condition_on_previous_text": False,
+        }
+        if not language:
+            kwargs.pop("language")
+        result = model.transcribe(self.video_path.get(), **kwargs)
 
         segments, info = result
         self.log(f"Detected language: {info.language}", "info")
 
-        srt_lines = []
-        for i, seg in enumerate(segments, 1):
-            start = format_timestamp(seg.start, always_include_hours=True, decimal_marker=",")
-            end = format_timestamp(seg.end, always_include_hours=True, decimal_marker=",")
-            srt_lines.append(f"{i}\n{start} --> {end}\n{seg.text.strip()}\n")
-            self.log(f"  [{start} → {end}] {seg.text.strip()}", "info")
+        srt_path = "video.srt"
+        count = 0
+        # Open once, flush as we go: the SRT file survives even if a later
+        # segment (or the AI step) fails.
+        with open(srt_path, "w", encoding="utf-8") as f:
+            try:
+                for i, seg in enumerate(segments, 1):
+                    start = format_timestamp(seg.start, always_include_hours=True, decimal_marker=",")
+                    end = format_timestamp(seg.end, always_include_hours=True, decimal_marker=",")
+                    line = seg.text.strip()
+                    if not line:
+                        continue
+                    f.write(f"{i}\n{start} --> {end}\n{line}\n")
+                    f.flush()
+                    count += 1
+                    self.log(f"  [{start} → {end}] {line}", "info")
+            except Exception as e:
+                raise RuntimeError(f"Transcription failed at segment {count + 1}: {e}") from e
 
-        with open("video.srt", "w", encoding="utf-8") as f:
-            f.write("\n".join(srt_lines))
-
-        self.log(f"SRT saved  →  video.srt  ({len(srt_lines)} lines)", "success")
+        self.log(f"SRT saved  →  {srt_path}  ({count} segments)", "success")
         self.pb.set(0.6)
 
     def _step_ai(self):
@@ -488,26 +530,81 @@ class App:
         ai_model = self.ai_model.get().strip()
         self.log(f"AI →  OpenRouter  ·  {ai_model}", "info")
 
-        text = self._call_openrouter(self.openrouter_key, ai_model, prompt, subtitle)
-
-        text = text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(text)
+        text = self._call_openrouter_resilient(self.openrouter_key, ai_model, prompt, subtitle)
+        try:
+            data = self._parse_ai_response(text)
+        except AiErrorResponse as e:
+            self.log(f"AI refused: {e}", "error")
+            self.log("Retrying with a tolerant instruction…", "info")
+            text = self._call_openrouter_resilient(self.openrouter_key, ai_model,
+                                                   prompt + TOLERANT_HINT, subtitle)
+            data = self._parse_ai_response(text)
 
         with open("highlight.json", "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
 
-        self.log("highlight.json saved  →", "success")
+        clips = data.get("clips", []) if isinstance(data, dict) else data
+        self.log(f"highlight.json saved  →  ({len(clips)} clips)", "success")
         self.pb.set(1.0)
+
+    @staticmethod
+    def _parse_ai_response(text):
+        text = text.replace("```json", "").replace("```", "").strip()
+        data = json.loads(text)
+        if isinstance(data, dict) and isinstance(data.get("error"), str):
+            raise AiErrorResponse(data["error"])
+        if isinstance(data, dict) and "clips" in data:
+            return data
+        if isinstance(data, list):
+            return {"clips": data}
+        raise AiErrorResponse("unexpected response format")
+
+    def _available_models(self):
+        values = self.ai_model_combo.cget("values") or FREE_MODELS_FALLBACK
+        return [v for v in values if v]
+
+    def _call_openrouter_resilient(self, api_key, first_model, prompt, subtitle):
+        candidates = self._available_models()
+        if first_model not in candidates:
+            candidates = [first_model] + candidates
+        tried = []
+        for model in candidates:
+            if model in tried:
+                continue
+            tried.append(model)
+            try:
+                return self._call_openrouter(api_key, model, prompt, subtitle)
+            except RateLimitedError:
+                self.log(f"  {model} is rate-limited (429) — trying next free model…", "error")
+        raise RuntimeError(
+            "All OpenRouter free models are rate-limited right now. "
+            "Wait a minute and press Run again.")
+
+    @staticmethod
+    def _retry_after_seconds(resp, fallback):
+        header = resp.headers.get("Retry-After")
+        if header:
+            try:
+                return min(int(header), 30)
+            except ValueError:
+                pass
+        return fallback
 
     @staticmethod
     def _call_openrouter(api_key, ai_model, prompt, subtitle):
         headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
         payload = {"model": ai_model,
                    "messages": [{"role": "user", "content": f"{prompt}\n\nSubtitle:\n\n{subtitle}"}]}
-        resp = requests.post(OPENROUTER_URL, json=payload, headers=headers, timeout=300)
-        if resp.status_code != 200:
-            raise RuntimeError(f"OpenRouter error {resp.status_code}: {resp.text[:500]}")
-        return resp.json()["choices"][0]["message"]["content"]
+        for attempt in range(3):
+            resp = requests.post(OPENROUTER_URL, json=payload, headers=headers, timeout=300)
+            if resp.status_code == 429:
+                wait = App._retry_after_seconds(resp, fallback=2 * (attempt + 1))
+                time.sleep(wait)
+                continue
+            if resp.status_code != 200:
+                raise RuntimeError(f"OpenRouter error {resp.status_code}: {resp.text[:500]}")
+            return resp.json()["choices"][0]["message"]["content"]
+        raise RateLimitedError(ai_model)
 
     def _load_whisper(self):
         def job():

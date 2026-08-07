@@ -7,3 +7,4 @@ config.py
 video.mp4
 video.srt
 highlight.json
+app.log

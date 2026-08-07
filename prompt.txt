@@ -15,9 +15,11 @@ Rules:
 9. Keep every major plot twist.
 10. Keep climax.
 
-Return ONLY JSON.
+IMPORTANT:
 
-Example:
+- The subtitle transcript below may be noisy, auto-generated, in mixed languages, or contain errors. Ignore the noise and still return your BEST estimate of the story's key scenes based on whatever words are recognizable.
+- NEVER return an error, an explanation, or any text outside the JSON.
+- ALWAYS return exactly this JSON shape, even if you must guess:
 
 {
   "clips":[

@@ -1,8 +1,11 @@
 import json
 import os
 import queue
+import shutil
+import subprocess
 import threading
 import time
+import tkinter as tk
 
 import customtkinter as ctk
 import requests
@@ -12,15 +15,21 @@ WHISPER_MODELS = ["medium", "large-v3", "small", "base", "tiny"]
 DEFAULT_WHISPER = "medium"
 
 FREE_MODELS_FALLBACK = [
-    "google/gemma-4-31b-it:free",
+    "nvidia/nemotron-3-nano-30b-a3b-reasoning:free",
+    "nvidia/nemotron-3-nano-30b-a3b:free",
     "openai/gpt-oss-20b:free",
-    "google/gemma-4-26b-a4b-it:free",
-    "nvidia/nemotron-3-super-120b-a12b:free",
+    "google/gemma-4-31b-it:free",
+    "qwen/qwen3-4b:free",
 ]
-DEFAULT_MODEL = "google/gemma-4-31b-it:free"
+DEFAULT_MODEL = FREE_MODELS_FALLBACK[0]
 
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
+
+FFMPEG = shutil.which("ffmpeg") or "ffmpeg"
+FFPROBE = shutil.which("ffprobe") or "ffprobe"
+PROJECTS_DIR = "projects"
+LAST_PROJECT_FILE = os.path.join(PROJECTS_DIR, ".last_project")
 
 # ---------- Palette ----------
 BG      = "#0e1117"
@@ -41,6 +50,10 @@ class StopRequested(Exception):
 
 
 class RateLimitedError(Exception):
+    pass
+
+
+class InvalidModelError(Exception):
     pass
 
 
@@ -81,6 +94,10 @@ class App:
 
         self.msg_queue = queue.Queue()
         self.running = False
+        self.cutting = False
+        self.highlights = []
+        self.project_name = ""
+        self.stages = {"transcribe": False, "ai": False, "cut": False}
 
         self.video_path = ctk.StringVar(value="video.mp4")
         self.prompt_path = ctk.StringVar(value="prompt.txt")
@@ -93,6 +110,146 @@ class App:
         self._build_ui()
         self._poll_queue()
         self._fetch_models_async("startup")
+        self._load_highlights()
+        self._restore_last_project()
+
+    # ----------------------------------------------------------------
+    # Project system (CapCut-style: folder per project, resume anytime)
+    # ----------------------------------------------------------------
+
+    def _projects_dir(self):
+        os.makedirs(PROJECTS_DIR, exist_ok=True)
+        return PROJECTS_DIR
+
+    def _project_folder(self):
+        if not self.project_name:
+            return None
+        return os.path.join(self._projects_dir(), self.project_name)
+
+    def _project_file(self, fname):
+        folder = self._project_folder()
+        return os.path.join(folder, fname) if folder else fname
+
+    def _project_list(self):
+        d = self._projects_dir()
+        names = [n for n in os.listdir(d) if os.path.isdir(os.path.join(d, n)) and not n.startswith(".")]
+        return sorted(names, key=str.lower)
+
+    def _save_project(self):
+        folder = self._project_folder()
+        if not folder:
+            return
+        os.makedirs(folder, exist_ok=True)
+        state = {
+            "name": self.project_name,
+            "source_video": self.video_path.get(),
+            "prompt": self.prompt_path.get(),
+            "whisper_model": self.whisper_model.get(),
+            "language": self.language.get(),
+            "ai_model": self.ai_model.get(),
+            "stages": self.stages,
+            "updated": time.strftime("%Y-%m-%d %H:%M"),
+        }
+        with open(os.path.join(folder, "project.json"), "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2, ensure_ascii=False)
+        try:
+            with open(LAST_PROJECT_FILE, "w", encoding="utf-8") as f:
+                f.write(self.project_name)
+        except OSError:
+            pass
+
+    def _load_project(self, name):
+        name = os.path.basename(str(name).strip())
+        folder = os.path.join(self._projects_dir(), name)
+        if not os.path.isdir(folder):
+            self.log(f"Project not found: {name}", "error")
+            return
+        self.project_name = name
+        try:
+            with open(os.path.join(folder, "project.json"), encoding="utf-8") as f:
+                state = json.load(f)
+        except FileNotFoundError:
+            state = {}
+        self.video_path.set(state.get("source_video") or "")
+        if state.get("prompt"):
+            self.prompt_path.set(state["prompt"])
+        if state.get("whisper_model"):
+            self.whisper_model.set(state["whisper_model"])
+        for key in ("ai_model", "language"):
+            if state.get(key):
+                getattr(self, key).set(state[key])
+        self.stages = {
+            "transcribe": bool(state.get("stages", {}).get("transcribe")),
+            "ai": bool(state.get("stages", {}).get("ai")),
+            "cut": bool(state.get("stages", {}).get("cut")),
+        }
+        self._refresh_project_menu()
+        self._update_stage_chips()
+        self._load_highlights()
+        if not os.path.exists(self.video_path.get()):
+            self.log(f"Note: saved video not found ({self.video_path.get()}) — browse to re-link it.", "error")
+        else:
+            self.log(f"Project opened: {name} — resume at stage {self._stage_summary()}", "success")
+
+    def _restore_last_project(self):
+        name = None
+        try:
+            if os.path.exists(LAST_PROJECT_FILE):
+                with open(LAST_PROJECT_FILE, encoding="utf-8") as f:
+                    name = f.read().strip()
+        except OSError:
+            pass
+        if name and os.path.isdir(os.path.join(self._projects_dir(), name)):
+            self._load_project(name)
+
+    def _new_project(self):
+        from tkinter import simpledialog
+        name = simpledialog.askstring("New Project", "Project name:", parent=self.root)
+        if not name:
+            return
+        name = os.path.basename(name.strip())
+        if not name:
+            return
+        folder = os.path.join(self._projects_dir(), name)
+        os.makedirs(folder, exist_ok=True)
+        self.project_name = name
+        self.stages = {"transcribe": False, "ai": False, "cut": False}
+        self._save_project()
+        self._refresh_project_menu()
+        self._update_stage_chips()
+        self.log(f"New project created: {name}", "success")
+        self.log("Choose a video, then press Run. You can close the app anytime — "
+                 "the project resumes from where you left off.", "info")
+
+    def _open_project_dialog(self):
+        from tkinter import filedialog
+        d = filedialog.askdirectory(
+            title="Open project folder", initialdir=os.path.abspath(self._projects_dir()))
+        if d:
+            self._load_project(os.path.basename(d.rstrip("/")))
+
+    def _refresh_project_menu(self):
+        try:
+            self.project_menu.configure(values=["Add new…"] + self._project_list())
+            if self.project_name:
+                self.project_menu.set(self.project_name)
+        except Exception:
+            pass
+
+    def _stage_summary(self):
+        if not any(self.stages.values()):
+            return "beginning (nothing done yet)"
+        done = [name for name, ok in self.stages.items() if ok]
+        return "done: " + ", ".join(done)
+
+    def _update_stage_chips(self):
+        for key, label in (("transcribe", "Transcribe"), ("ai", "AI Plan"), ("cut", "Cut Video")):
+            ok = self.stages.get(key, False)
+            self.stage_chips[key].configure(
+                text=("✓ " if ok else "○ ") + label,
+                text_color=GREEN if ok else MUTED,
+                fg_color=PANEL_2 if ok else PANEL,
+                border_width=1, border_color="#1e5c3a" if ok else BORDER)
 
     # ----------------------------------------------------------------
     # Config / API keys
@@ -125,9 +282,10 @@ class App:
         left.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
         left.grid_columnconfigure(0, weight=1)
 
-        self._card_source(left)
+        self._card_project(left)
         self._card_transcription(left)
         self._card_ai(left)
+        self._card_highlights(left)
 
         right = ctk.CTkFrame(body, fg_color=BG, corner_radius=0, width=430)
         right.grid(row=0, column=1, sticky="nsew")
@@ -167,13 +325,50 @@ class App:
         ctk.CTkLabel(head, text=title, font=ctk.CTkFont(size=14, weight="bold"), text_color=FG).pack(side="left")
         ctk.CTkFrame(head, fg_color=BORDER, height=1).pack(fill="x", pady=(10, 0))
 
-    def _card_source(self, parent):
+    def _card_project(self, parent):
         card = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=12, border_width=1, border_color=BORDER)
         card.grid(row=0, column=0, sticky="ew", pady=(0, 14))
         card.grid_columnconfigure(0, weight=1)
-        self._section_title(card, "🎬", "Source Files", 0)
-        self._file_row(card, "Video File", self.video_path, "video", 1)
-        self._file_row(card, "Prompt", self.prompt_path, "prompt", 2)
+        self._section_title(card, "🗂", "Project", 0)
+
+        proj_row = ctk.CTkFrame(card, fg_color="transparent")
+        proj_row.grid(row=1, column=0, sticky="ew", padx=16, pady=(8, 0))
+        proj_row.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(proj_row, text="Project", font=ctk.CTkFont(size=13), text_color=MUTED,
+                     width=66, anchor="w").grid(row=0, column=0, sticky="w")
+        self.project_menu = ctk.CTkOptionMenu(proj_row, values=["Add new…"] + self._project_list(),
+                                              command=self._on_project_menu,
+                                              fg_color=PANEL_2, button_color=ACCENT,
+                                              corner_radius=8,
+                                              font=ctk.CTkFont(size=13), height=36)
+        self.project_menu.grid(row=0, column=1, sticky="ew")
+        ctk.CTkButton(proj_row, text="New", width=56, height=36, corner_radius=8,
+                      font=ctk.CTkFont(size=13), fg_color=ACCENT, hover_color=ACCENT_D,
+                      command=self._new_project).grid(row=0, column=2, padx=(8, 0))
+        ctk.CTkButton(proj_row, text="Open…", width=62, height=36, corner_radius=8,
+                      font=ctk.CTkFont(size=13), fg_color=PANEL_2, hover_color="#334155",
+                      text_color=FG, border_width=1, border_color=BORDER,
+                      command=self._open_project_dialog).grid(row=0, column=3, padx=(8, 0))
+
+        chips = ctk.CTkFrame(card, fg_color="transparent")
+        chips.grid(row=2, column=0, sticky="ew", padx=16, pady=(10, 0))
+        self.stage_chips = {}
+        for key, label in (("transcribe", "Transcribe"), ("ai", "AI Plan"), ("cut", "Cut Video")):
+            c = ctk.CTkLabel(chips, text="○ " + label, font=ctk.CTkFont(size=12, weight="bold"),
+                             text_color=MUTED, corner_radius=10, height=26, padx=12,
+                             fg_color=PANEL, border_width=1, border_color=BORDER)
+            c.pack(side="left", padx=(0, 8))
+            self.stage_chips[key] = c
+        self._update_stage_chips()
+
+        self._file_row(card, "Video File", self.video_path, "video", 4)
+        self._file_row(card, "Prompt", self.prompt_path, "prompt", 5)
+
+    def _on_project_menu(self, name):
+        if name == "Add new…" or not name:
+            self._new_project()
+            return
+        self._load_project(name)
 
     def _file_row(self, parent, label, var, kind, row):
         row_f = ctk.CTkFrame(parent, fg_color="transparent")
@@ -255,6 +450,39 @@ class App:
         ctk.CTkLabel(card, text="Live list from OpenRouter — tap the dropdown to refresh. (free = 0.00 $)",
                      font=ctk.CTkFont(size=12), text_color=MUTED).grid(row=2, column=0, sticky="w",
                                                                        padx=16, pady=(4, 14))
+
+    def _card_highlights(self, parent):
+        card = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=12, border_width=1, border_color=BORDER)
+        card.grid(row=3, column=0, sticky="ew", pady=(14, 0))
+        card.grid_columnconfigure(0, weight=1)
+        self._section_title(card, "🎬", "Highlights → Video", 0)
+
+        head = ctk.CTkFrame(card, fg_color="transparent")
+        head.grid(row=1, column=0, sticky="ew", padx=16, pady=(8, 0))
+        self.clip_count_label = ctk.CTkLabel(head, text="no highlight.json loaded",
+                                             font=ctk.CTkFont(size=12), text_color=MUTED)
+        self.clip_count_label.pack(side="left")
+        ctk.CTkButton(head, text="⟳ Reload", width=80, height=30, corner_radius=8,
+                      font=ctk.CTkFont(size=12), fg_color=PANEL_2, hover_color="#334155",
+                      text_color=FG, border_width=1, border_color=BORDER,
+                      command=self._load_highlights).pack(side="right")
+
+        self.clip_list = tk.Listbox(card, height=5, background="#0d1017", fg="#d7e2f5",
+                                    selectbackground=ACCENT, selectforeground="#ffffff",
+                                    highlightthickness=0, borderwidth=0, font=("Monospace", 10))
+        self.clip_list.grid(row=2, column=0, sticky="ew", padx=16, pady=(8, 0))
+
+        btns = ctk.CTkFrame(card, fg_color="transparent")
+        btns.grid(row=3, column=0, sticky="ew", padx=16, pady=(10, 14))
+        self.cut_btn = ctk.CTkButton(btns, text="✂  Cut Highlight Video", height=38, corner_radius=9,
+                                     font=ctk.CTkFont(size=13, weight="bold"), fg_color=ACCENT,
+                                     hover_color=ACCENT_D, state="disabled", command=self._cut_video)
+        self.cut_btn.pack(side="left")
+        self.open_btn = ctk.CTkButton(btns, text="Open Output", height=38, width=110, corner_radius=9,
+                                      font=ctk.CTkFont(size=13), fg_color=PANEL_2, hover_color="#334155",
+                                      text_color=FG, border_width=1, border_color=BORDER,
+                                      state="disabled", command=self._open_output)
+        self.open_btn.pack(side="left", padx=(8, 0))
 
     # ---- run card (right column) ----
     def _build_run_card(self, parent):
@@ -339,6 +567,8 @@ class App:
                                               filetypes=[("Text", "*.txt"), ("All files", "*")])
             if path:
                 self.prompt_path.set(path)
+        if self.project_name:
+            self._save_project()
 
     # ----------------------------------------------------------------
     # Live OpenRouter free-model list
@@ -362,11 +592,51 @@ class App:
     def _apply_models(self, models, _source):
         if not models:
             return False
+        dead = self._load_dead_models()
+        ordered = [m for m in FREE_MODELS_FALLBACK if m not in dead]
+        for m in models:
+            if m not in ordered and m not in dead:
+                ordered.append(m)
         current = self.ai_model.get()
-        self.ai_model_combo.configure(values=models)
-        self.ai_model.set(current if current in models else models[0])
-        self._model_count = len(models)
+        self.ai_model_combo.configure(values=ordered)
+        self.ai_model.set(current if current in ordered else ordered[0])
+        self._model_count = len(ordered)
         return True
+
+    @staticmethod
+    def _dead_models_file():
+        return os.path.join(PROJECTS_DIR, ".dead_models.json")
+
+    @classmethod
+    def _load_dead_models(cls):
+        try:
+            with open(cls._dead_models_file(), "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except (OSError, ValueError):
+            return set()
+
+    def _deal_model(self, model):
+        if not hasattr(self, "_dead_models"):
+            self._dead_models = set(self._load_dead_models())
+        self._dead_models.add(model)
+        try:
+            os.makedirs(PROJECTS_DIR, exist_ok=True)
+            with open(self._dead_models_file(), "w", encoding="utf-8") as f:
+                json.dump(sorted(self._dead_models), f)
+        except OSError:
+            pass
+
+        def gui_update():
+            values = list(self.ai_model_combo.cget("values") or [])
+            if model in values:
+                values.remove(model)
+                self.ai_model_combo.configure(values=values)
+                if self.ai_model.get() == model:
+                    self.ai_model.set(values[0] if values else model)
+        try:
+            self.root.after(0, gui_update)
+        except RuntimeError:
+            pass
 
     def _fetch_models_async(self, source):
         def job():
@@ -433,6 +703,11 @@ class App:
     def _run(self):
         if self.running:
             return
+        if not self.project_name:
+            from tkinter import messagebox
+            messagebox.showerror("No Project", "Create or open a project first —\n"
+                                 "each movie gets its own project.")
+            return
         if not os.path.exists(self.video_path.get()):
             from tkinter import messagebox
             messagebox.showerror("Error", "Video file not found:\n" + self.video_path.get())
@@ -447,7 +722,8 @@ class App:
                                 "Set OPENROUTER_API_KEY in config.py.")
             return
 
-        self.log("── Starting extraction ──", "info")
+        self._save_project()
+        self.log("── Starting pipeline ──", "info")
         self.status_text.set("Running...")
         self.running = True
         self.run_btn.configure(text="■  Stop", fg_color="#b03a2e", hover_color="#8f2d24")
@@ -457,16 +733,42 @@ class App:
 
     def _work(self):
         try:
-            self._step_transcribe()
-            self._step_ai()
-            self.log("── Done ──", "success")
-            self.log("Outputs saved to video.srt and highlight.json", "success")
+            if not self.stages.get("transcribe"):
+                self._step_transcribe()
+                self.stages["transcribe"] = True
+                self._save_project()
+                self.root.after(0, self._update_stage_chips)
+            else:
+                self.log("Transcribe: already done — skipping (resume).", "info")
+
+            if self._stop_requested():
+                raise StopRequested()
+
+            if not self.stages.get("ai"):
+                self._step_ai()
+                self.stages["ai"] = True
+                self._save_project()
+                self.root.after(0, self._update_stage_chips)
+            else:
+                self.log("AI plan: already done — skipping (resume).", "info")
+                self._load_highlights()
+
+            if not self.stages.get("cut"):
+                self.log("── Done ──", "success")
+                self.log("Stages done: transcribe + AI plan. Cutting video…", "success")
+                self.root.after(200, self._cut_video_after_pipeline)
+            else:
+                self.log("Cut: already done — project fully complete.", "success")
+                self.log("── Done ──", "success")
         except StopRequested:
             self.log("Pipeline stopped by user.", "info")
         except Exception as e:
             self.log(f"Pipeline failed: {type(e).__name__}: {e}", "error")
         finally:
             self.root.after(0, self._reset_running)
+
+    def _stop_requested(self):
+        return False
 
     def _reset_running(self):
         self.running = False
@@ -499,7 +801,8 @@ class App:
         segments, info = result
         self.log(f"Detected language: {info.language}", "info")
 
-        srt_path = "video.srt"
+        srt_path = self._project_file("video.srt")
+        os.makedirs(os.path.dirname(srt_path), exist_ok=True)
         count = 0
         # Open once, flush as we go: the SRT file survives even if a later
         # segment (or the AI step) fails.
@@ -522,7 +825,8 @@ class App:
         self.pb.set(0.6)
 
     def _step_ai(self):
-        with open("video.srt", "r", encoding="utf-8") as f:
+        srt_path = self._project_file("video.srt")
+        with open(srt_path, "r", encoding="utf-8") as f:
             subtitle = f.read()
         with open(self.prompt_path.get(), "r", encoding="utf-8") as f:
             prompt = f.read()
@@ -540,17 +844,25 @@ class App:
                                                    prompt + TOLERANT_HINT, subtitle)
             data = self._parse_ai_response(text)
 
-        with open("highlight.json", "w", encoding="utf-8") as f:
+        with open(self._project_file("highlight.json"), "w", encoding="utf-8") as f:
             json.dump(data, f, indent=4, ensure_ascii=False)
 
         clips = data.get("clips", []) if isinstance(data, dict) else data
         self.log(f"highlight.json saved  →  ({len(clips)} clips)", "success")
         self.pb.set(1.0)
 
+        self._load_highlights()
+        self.root.after(200, self._cut_video_after_pipeline)
+
     @staticmethod
     def _parse_ai_response(text):
-        text = text.replace("```json", "").replace("```", "").strip()
-        data = json.loads(text)
+        if not text or not str(text).strip():
+            raise AiErrorResponse("empty response from AI (content was null)")
+        text = str(text).replace("```json", "").replace("```", "").strip()
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as e:
+            raise AiErrorResponse(f"response was not valid JSON: {str(e)[:80]}") from e
         if isinstance(data, dict) and isinstance(data.get("error"), str):
             raise AiErrorResponse(data["error"])
         if isinstance(data, dict) and "clips" in data:
@@ -561,11 +873,11 @@ class App:
 
     def _available_models(self):
         values = self.ai_model_combo.cget("values") or FREE_MODELS_FALLBACK
-        return [v for v in values if v]
+        return [v for v in values if v and v not in getattr(self, "_dead_models", ())]
 
     def _call_openrouter_resilient(self, api_key, first_model, prompt, subtitle):
         candidates = self._available_models()
-        if first_model not in candidates:
+        if first_model not in candidates and first_model not in getattr(self, "_dead_models", ()):
             candidates = [first_model] + candidates
         tried = []
         for model in candidates:
@@ -575,10 +887,25 @@ class App:
             try:
                 return self._call_openrouter(api_key, model, prompt, subtitle)
             except RateLimitedError:
-                self.log(f"  {model} is rate-limited (429) — trying next free model…", "error")
-        raise RuntimeError(
-            "All OpenRouter free models are rate-limited right now. "
-            "Wait a minute and press Run again.")
+                self.log(f"  {model} rate-limited (429) → trying next free model…", "error")
+            except InvalidModelError:
+                self.log(f"  {model} not available on OpenRouter anymore — removed from list.", "error")
+                self._deal_model(model)
+            except AiErrorResponse as e:
+                self.log(f"  {model} bad reply ({e}) → trying next free model…", "error")
+        live = [m for m in candidates if m not in getattr(self, "_dead_models", ())]
+        if not live:
+            raise InvalidModelError(
+                "None of the configured models are available on OpenRouter anymore. "
+                "Pick a model from the drop-down list on the right.")
+        # last resort: give the very first live model one more shot
+        self.log(f"  All {len(live)} models failed once — one final retry with {live[0]}…", "error")
+        time.sleep(5)
+        try:
+            return self._call_openrouter(api_key, live[0], prompt, subtitle)
+        except (RateLimitedError, AiErrorResponse) as e:
+            raise RuntimeError(
+                f"All free models failed (rate-limited or empty replies). Last error: {e}") from e
 
     @staticmethod
     def _retry_after_seconds(resp, fallback):
@@ -602,8 +929,18 @@ class App:
                 time.sleep(wait)
                 continue
             if resp.status_code != 200:
-                raise RuntimeError(f"OpenRouter error {resp.status_code}: {resp.text[:500]}")
-            return resp.json()["choices"][0]["message"]["content"]
+                if resp.status_code == 400 and "not a valid model ID" in resp.text:
+                    raise InvalidModelError(ai_model)
+                raise RuntimeError(
+                    f"OpenRouter error {resp.status_code}: {resp.text[:500]}")
+            data = resp.json()
+            choice = (data.get("choices") or [{}])[0]
+            message = choice.get("message") or {}
+            content = message.get("content")
+            if content is None:
+                raise AiErrorResponse(
+                    f"empty content (finish_reason={choice.get('finish_reason', '?')})")
+            return content
         raise RateLimitedError(ai_model)
 
     def _load_whisper(self):
@@ -615,6 +952,264 @@ class App:
             except Exception as e:
                 self.log(f"Model load failed: {e}", "error")
         threading.Thread(target=job, daemon=True).start()
+
+    # ----------------------------------------------------------------
+    # Highlights → video cutting
+    # ----------------------------------------------------------------
+
+    COLOR_PRESETS = {
+        "original": "",
+        "natural": "eq=contrast=1.05:saturation=1.05",
+        "cinematic": "eq=contrast=1.12:saturation=1.08:brightness=0.01:gamma=0.98",
+        "warm": "colorchannelmixer=rr=1.04:gg=1.0:bb=0.94",
+        "cool": "colorchannelmixer=rr=0.95:gg=1.0:bb=1.05",
+        "dramatic": "eq=contrast=1.18:saturation=1.0:brightness=-0.02",
+        "desaturated": "eq=saturation=0.5",
+        "high_contrast": "eq=contrast=1.25:saturation=1.1",
+        "soft": "eq=contrast=0.95:saturation=0.94:brightness=0.02",
+    }
+
+    TRANSITION_DURATION = {"cut": 0.0, "fade": 0.4, "crossfade": 0.4,
+                           "fade_black": 0.7, "fade_white": 0.7}
+
+    def _load_highlights(self):
+        path = self._project_file("highlight.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                self.highlights = json.load(f)
+            clips = self.highlights.get("clips", [])
+            self.clip_list.delete(0, "end")
+            for c in clips:
+                self.clip_list.insert("end", f"{c.get('start','?')} → {c.get('end','?')}   {c.get('reason','')}")
+            self.clip_count_label.configure(
+                text=f"{len(clips)} clips loaded" if clips else "0 clips in file")
+            self.cut_btn.configure(state="normal" if clips else "disabled")
+            self.log(f"Loaded {len(clips)} highlight clips from highlight.json", "success")
+        except FileNotFoundError:
+            self.highlights = []
+            self.cut_btn.configure(state="disabled")
+            self.clip_count_label.configure(text="no highlight.json yet")
+        except Exception as e:
+            self.log(f"Could not read highlight.json: {e}", "error")
+
+    @staticmethod
+    def _ts_to_seconds(ts):
+        if isinstance(ts, (int, float)):
+            return float(ts)
+        parts = str(ts).replace(",", ".").split(":")
+        secs = float(parts.pop())
+        mult = 60
+        while parts:
+            secs += float(parts.pop()) * mult
+            mult *= 60
+        return secs
+
+    @staticmethod
+    def _has_audio(path):
+        try:
+            out = subprocess.run(
+                [FFPROBE, "-v", "error", "-select_streams", "a:0",
+                 "-show_entries", "stream=codec_name", "-of", "csv=p=0", path],
+                capture_output=True, text=True, timeout=60)
+            return bool(out.stdout.strip())
+        except Exception:
+            return True
+
+    def _cut_video(self):
+        if self.cutting or self.running:
+            return
+        clips = (self.highlights or {}).get("clips", [])
+        if not clips:
+            from tkinter import messagebox
+            messagebox.showerror("No highlights", "Load a highlight.json with clips first.")
+            return
+        video = self.video_path.get()
+        if not os.path.exists(video):
+            from tkinter import messagebox
+            messagebox.showerror("Error", "Video not found:\n" + video)
+            return
+
+        self.cutting = True
+        self.status_text.set("Cutting video…")
+        self.cut_btn.configure(state="disabled", text="Cutting…")
+        self.pb.set(0)
+        threading.Thread(target=self._do_cut, args=(video, clips), daemon=True).start()
+
+    def _do_cut(self, video, clips):
+        try:
+            os.makedirs(self._project_folder() or ".", exist_ok=True)
+            w, h, fps, duration = self._probe_video(video)
+            has_audio = self._has_audio(video)
+            self.log(f"Source: {w}x{h} @ {fps}fps · {duration:.0f}s "
+                     f"· audio={'yes' if has_audio else 'no'}", "info")
+
+            chains = []
+            seq = 0
+            self.log(f"Editing plan → {len(clips)} clips", "info")
+            for idx, clip in enumerate(clips, 1):
+                s = self._ts_to_seconds(clip.get("start", 0))
+                e = self._ts_to_seconds(clip.get("end", s))
+                dur = e - s
+                if dur < 0.3 or s >= max(duration - 0.1, 0):
+                    self.log(f"  clip {idx} skipped (invalid range {s:.1f}→{e:.1f}s)", "error")
+                    continue
+                seq += 1
+                v, a = self._build_clip_chain(seq, clip, w, h, fps, dur, has_audio)
+                chains.append((v, a))
+                self.log(f"  clip {idx}: {s:.1f}s → {e:.1f}s · "
+                         f"fx={clip.get('visual_effect', 'none')} · "
+                         f"color={clip.get('color', {}).get('preset', 'original')} · "
+                         f"audio={clip.get('audio', 'original')}", "info")
+                self.pb.set(idx / (len(clips) + 1))
+
+            if not chains:
+                raise RuntimeError("No valid clips to cut.")
+
+            n = len(chains)
+            inputs = "".join(f"[v{i}][a{i}]" for i in range(1, n + 1)) if has_audio else \
+                     "".join(f"[v{i}]" for i in range(1, n + 1))
+            concat = (f"{inputs}concat=n={n}:v=1:a={1 if has_audio else 0}"
+                      f"[outv]" + ("[outa]" if has_audio else ""))
+            fc = "; ".join(v for v, _ in chains) + ";" \
+                 + "; ".join(a for _, a in chains if a) + ";" + concat
+
+            folder = self._project_folder() or "."
+            output = os.path.join(folder, "highlight_video.mp4")
+            cmd = [FFMPEG, "-y", "-loglevel", "error", "-i", video,
+                   "-filter_complex", fc, "-map", "[outv]"]
+            if has_audio:
+                cmd += ["-map", "[outa]"]
+            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
+                    "-c:a", "aac", "-b:a", "128k",
+                    "-movflags", "+faststart", output]
+
+            self.log("Encoding final video…", "info")
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+            if proc.returncode != 0 or not os.path.exists(output):
+                raise RuntimeError(f"ffmpeg failed: {proc.stderr[-800:]}")
+
+            self.pb.set(1.0)
+            self.stages["cut"] = True
+            self._save_project()
+            self.root.after(0, self._update_stage_chips)
+            self.root.after(0, lambda: self.open_btn.configure(state="normal"))
+            self.log(f"✔ Highlight video saved → {os.path.relpath(output)}", "success")
+        except Exception as e:
+            self.log(f"Cutting failed: {e}", "error")
+        finally:
+            self.root.after(0, self._reset_cutting)
+
+    def _cut_video_after_pipeline(self):
+        if self.running:
+            self.root.after(500, self._cut_video_after_pipeline)
+            return
+        if self.stages.get("cut"):
+            self.log("Cut already done — skipping.", "success")
+            return
+        self.log("Auto-starting video cut from edit plan…", "info")
+        self._cut_video()
+
+    def _reset_cutting(self):
+        self.cutting = False
+        self.status_text.set("Idle")
+        self.cut_btn.configure(state="normal", text="✂  Cut Highlight Video")
+
+    @staticmethod
+    def _clamp_seconds(value, lo, hi):
+        return min(max(value, lo), hi)
+
+    def _build_clip_chain(self, idx, clip, w, h, fps, dur, has_audio):
+        """Build per-clip ffmpeg filter chains honoring the edit-plan JSON."""
+        s = self._ts_to_seconds(clip.get("start", 0))
+        e = s + dur
+
+        v = (f"[0:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS,"
+             f"scale={w}:-2,fps={fps}")
+        a = (f"[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS"
+             if has_audio else "")
+
+        # ---- visual effects ----
+        fx = clip.get("visual_effect", "none") or "none"
+        frames = max(int(dur * fps), 1)
+        if fx == "slow_zoom_in":
+            v += (f",zoompan=z='min(1+0.12*on/{frames},1.15)':d=1:"
+                  f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={fps}")
+        elif fx == "slow_zoom_out":
+            v += (f",zoompan=z='max(1.12-0.12*on/{frames},1.0)':d=1:"
+                  f"x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':s={w}x{h}:fps={fps}")
+        elif fx == "soft_blur":
+            v += ",boxblur=2:1"
+        if fx == "subtle_vignette":
+            v += ",vignette"
+
+        # ---- color grading (preset + numeric params) ----
+        color = clip.get("color") or {}
+        preset = self.COLOR_PRESETS.get(color.get("preset", "original"), "")
+        if preset:
+            v += "," + preset
+        nums = []
+        for key, default in (("brightness", 0), ("contrast", 1),
+                             ("saturation", 1), ("gamma", 1)):
+            val = color.get(key)
+            if isinstance(val, (int, float)) and val != default:
+                nums.append(f"{key}={val}")
+        if nums:
+            v += ",eq=" + ":".join(nums)
+
+        # ---- transitions (fade in / fade out) ----
+        ti = clip.get("transition_in", "cut") or "cut"
+        to = clip.get("transition_out", "cut") or "cut"
+        fi = self.TRANSITION_DURATION.get(ti, 0.0)
+        fo = self.TRANSITION_DURATION.get(to, 0.0)
+        if fi:
+            d = min(fi, dur / 3)
+            v += f",fade=t=in:st=0:d={d:.3f}:color={'white' if ti == 'fade_white' else 'black'}"
+        if fo:
+            d = min(fo, dur / 3)
+            v += (f",fade=t=out:st={max(dur - d, 0):.3f}:d={d:.3f}:"
+                  f"color={'white' if to == 'fade_white' else 'black'}")
+
+        v += f"[v{idx}]"
+
+        # ---- audio treatment ----
+        if has_audio:
+            ap = clip.get("audio", "original") or "original"
+            if ap in ("normalize", "normalize_and_fade"):
+                a += ",loudnorm=I=-16:TP=-1.5:LRA=11"
+            if ap in ("fade_in", "normalize_and_fade"):
+                a += ",afade=t=in:st=0:d=0.3"
+            if ap in ("fade_out", "normalize_and_fade"):
+                a += f",afade=t=out:st={max(dur - 0.3, 0):.3f}:d=0.3"
+            a += f"[a{idx}]"
+
+        return v, a
+
+    def _probe_video(self, path):
+        out = subprocess.run(
+            [FFPROBE, "-v", "error",
+             "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,r_frame_rate",
+             "-show_entries", "format=duration",
+             "-of", "json", path],
+            capture_output=True, text=True, timeout=60)
+        data = json.loads(out.stdout)
+        st = data["streams"][0]
+        w, h = int(st["width"]), int(st["height"])
+        num, den = st["r_frame_rate"].split("/")
+        fps = round(float(num) / (float(den) or 1.0)) or 25
+        duration = float(data.get("format", {}).get("duration", 0))
+        return w, h, fps, duration
+
+    def _open_output(self):
+        folder = self._project_folder() or "."
+        path = os.path.abspath(os.path.join(folder, "highlight_video.mp4"))
+        if os.path.exists(path):
+            try:
+                subprocess.Popen(["xdg-open", folder])
+            except OSError:
+                self.log(f"Open the folder manually: {folder}", "info")
+        else:
+            self.log("No output video yet — cut one first.", "info")
 
 
 def main():

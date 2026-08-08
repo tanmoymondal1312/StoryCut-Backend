@@ -8,3 +8,8 @@ video.mp4
 video.srt
 highlight.json
 app.log
+outputs/
+cuts_tmp/
+*.mp4
+projects/
+.last_project

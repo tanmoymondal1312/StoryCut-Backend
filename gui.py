@@ -3,9 +3,12 @@ import os
 import queue
 import shutil
 import subprocess
+import sys
 import threading
 import time
 import tkinter as tk
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from glob import glob
 
 import customtkinter as ctk
 import requests
@@ -972,6 +975,8 @@ class App:
     TRANSITION_DURATION = {"cut": 0.0, "fade": 0.4, "crossfade": 0.4,
                            "fade_black": 0.7, "fade_white": 0.7}
 
+    _enc_cache = None
+
     def _load_highlights(self):
         path = self._project_file("highlight.json")
         try:
@@ -1043,8 +1048,7 @@ class App:
             self.log(f"Source: {w}x{h} @ {fps}fps · {duration:.0f}s "
                      f"· audio={'yes' if has_audio else 'no'}", "info")
 
-            chains = []
-            seq = 0
+            jobs = []
             self.log(f"Editing plan → {len(clips)} clips", "info")
             for idx, clip in enumerate(clips, 1):
                 s = self._ts_to_seconds(clip.get("start", 0))
@@ -1053,40 +1057,74 @@ class App:
                 if dur < 0.3 or s >= max(duration - 0.1, 0):
                     self.log(f"  clip {idx} skipped (invalid range {s:.1f}→{e:.1f}s)", "error")
                     continue
-                seq += 1
-                v, a = self._build_clip_chain(seq, clip, w, h, fps, dur, has_audio)
-                chains.append((v, a))
+                jobs.append((idx, clip, s, dur))
                 self.log(f"  clip {idx}: {s:.1f}s → {e:.1f}s · "
                          f"fx={clip.get('visual_effect', 'none')} · "
                          f"color={clip.get('color', {}).get('preset', 'original')} · "
                          f"audio={clip.get('audio', 'original')}", "info")
-                self.pb.set(idx / (len(clips) + 1))
 
-            if not chains:
+            if not jobs:
                 raise RuntimeError("No valid clips to cut.")
 
-            n = len(chains)
-            inputs = "".join(f"[v{i}][a{i}]" for i in range(1, n + 1)) if has_audio else \
-                     "".join(f"[v{i}]" for i in range(1, n + 1))
-            concat = (f"{inputs}concat=n={n}:v=1:a={1 if has_audio else 0}"
-                      f"[outv]" + ("[outa]" if has_audio else ""))
-            fc = "; ".join(v for v, _ in chains) + ";" \
-                 + "; ".join(a for _, a in chains if a) + ";" + concat
+            enc = self._machine_encoder()
+            cores = os.cpu_count() or 4
+            workers = max(1, min(cores, len(jobs)) if enc["hw"] else max(1, cores // 2))
+            threads = max(1, cores // max(workers, 1)) if not enc["hw"] else 2
+            self.log(f"Engine: {enc['label']} · {workers} parallel workers · "
+                     f"{threads} cpu threads each (total {cores} cores)", "info")
 
-            folder = self._project_folder() or "."
-            output = os.path.join(folder, "highlight_video.mp4")
-            cmd = [FFMPEG, "-y", "-loglevel", "error", "-i", video,
-                   "-filter_complex", fc, "-map", "[outv]"]
-            if has_audio:
-                cmd += ["-map", "[outa]"]
-            cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20",
-                    "-c:a", "aac", "-b:a", "128k",
-                    "-movflags", "+faststart", output]
+            tmp = os.path.join(self._project_folder() or ".", "cuts_tmp")
+            os.makedirs(tmp, exist_ok=True)
+            parts = [None] * len(jobs)
+            done = [0]
+            lock = threading.Lock()
 
-            self.log("Encoding final video…", "info")
+            def run(job):
+                idx, clip, s, dur = job
+                out = os.path.join(tmp, f"clip_{idx:03d}.mp4")
+                vf, af = self._build_clip_chain(idx, clip, w, h, fps, dur, has_audio)
+                cmd = [FFMPEG, "-y", "-loglevel", "error"]
+                if enc["hw"]:
+                    cmd += ["-hwaccel", "vaapi", "-vaapi_device", enc["dev"]]
+                cmd += ["-ss", f"{s:.3f}", "-t", f"{dur:.3f}", "-i", video]
+                if enc["hw"]:
+                    vf = vf + ",format=nv12,hwupload"
+                cmd += ["-vf", vf]
+                if af:
+                    cmd += ["-af", af]
+                cmd += ["-c:v"] + list(enc["codec"])
+                if not enc["hw"]:
+                    cmd += ["-threads", str(threads)]
+                cmd += ["-c:a", "aac", "-b:a", "128k", "-y", out]
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
+                if proc.returncode != 0 or not os.path.exists(out):
+                    raise RuntimeError(
+                        f"clip {idx} failed: {proc.stderr[-600:]}")
+                with lock:
+                    done[0] += 1
+                self.root.after(0, lambda d=done[0]: self.pb.set(0.1 + 0.8 * d / len(jobs)))
+                return out
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = {pool.submit(run, job): job[0] for job in jobs}
+                for fut in as_completed(futures):
+                    fut.result()
+
+            parts = [os.path.join(tmp, f"clip_{seq:03d}.mp4") for seq, *_ in jobs]
+            parts = [p for p in parts if os.path.exists(p)]
+            listf = os.path.join(tmp, "list.txt")
+            with open(listf, "w", encoding="utf-8") as f:
+                for p in parts:
+                    f.write(f"file '{os.path.abspath(p)}'\n")
+
+            output = os.path.join(self._project_folder() or ".", "highlight_video.mp4")
+            self.log(f"Concatenating {len(parts)} parts (stream copy, no re-encode)…", "info")
+            cmd = [FFMPEG, "-y", "-loglevel", "error", "-f", "concat", "-safe", "0",
+                   "-i", listf, "-c", "copy", "-movflags", "+faststart", output]
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
             if proc.returncode != 0 or not os.path.exists(output):
-                raise RuntimeError(f"ffmpeg failed: {proc.stderr[-800:]}")
+                raise RuntimeError(f"concat failed: {proc.stderr[-800:]}")
+            shutil.rmtree(tmp, ignore_errors=True)
 
             self.pb.set(1.0)
             self.stages["cut"] = True
@@ -1098,6 +1136,30 @@ class App:
             self.log(f"Cutting failed: {e}", "error")
         finally:
             self.root.after(0, self._reset_cutting)
+
+    @classmethod
+    def _machine_encoder(cls):
+        """Pick the best encoder for THIS machine (called once, cached)."""
+        if cls._enc_cache is not None:
+            return cls._enc_cache
+        # Linux + Intel iGPU (VAAPI) → hardware encode, near-zero CPU load
+        if sys.platform.startswith("linux"):
+            for dev in sorted(glob("/dev/dri/renderD*")):
+                probe = subprocess.run(
+                    [FFMPEG, "-y", "-v", "error", "-hwaccel", "vaapi",
+                     "-vaapi_device", dev, "-f", "lavfi",
+                     "-i", "testsrc=duration=1:size=320x240:rate=30",
+                     "-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi",
+                     "-global_quality", "24", "-f", "null", "-"],
+                    capture_output=True, text=True, timeout=30)
+                if probe.returncode == 0:
+                    cls._enc_cache = {
+                        "label": f"h264_vaapi hardware ({dev})", "hw": True,
+                        "dev": dev, "codec": ("h264_vaapi", "-global_quality", "24")}
+                    return cls._enc_cache
+        cls._enc_cache = {"label": "libx264 cpu (thread-capped)", "hw": False,
+                          "dev": None, "codec": ("libx264", "-preset", "veryfast", "-crf", "20")}
+        return cls._enc_cache
 
     def _cut_video_after_pipeline(self):
         if self.running:
@@ -1119,14 +1181,9 @@ class App:
         return min(max(value, lo), hi)
 
     def _build_clip_chain(self, idx, clip, w, h, fps, dur, has_audio):
-        """Build per-clip ffmpeg filter chains honoring the edit-plan JSON."""
-        s = self._ts_to_seconds(clip.get("start", 0))
-        e = s + dur
-
-        v = (f"[0:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS,"
-             f"scale={w}:-2,fps={fps}")
-        a = (f"[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS"
-             if has_audio else "")
+        """Plain per-clip filter chain for -vf/-af (no labels, no trim —
+        input -ss/-t handles the positioning)."""
+        v = f"fps={fps},scale={w}:-2"
 
         # ---- visual effects ----
         fx = clip.get("visual_effect", "none") or "none"
@@ -1169,9 +1226,8 @@ class App:
             v += (f",fade=t=out:st={max(dur - d, 0):.3f}:d={d:.3f}:"
                   f"color={'white' if to == 'fade_white' else 'black'}")
 
-        v += f"[v{idx}]"
-
         # ---- audio treatment ----
+        a = ""
         if has_audio:
             ap = clip.get("audio", "original") or "original"
             if ap in ("normalize", "normalize_and_fade"):
@@ -1180,7 +1236,7 @@ class App:
                 a += ",afade=t=in:st=0:d=0.3"
             if ap in ("fade_out", "normalize_and_fade"):
                 a += f",afade=t=out:st={max(dur - 0.3, 0):.3f}:d=0.3"
-            a += f"[a{idx}]"
+            a = a.lstrip(",")
 
         return v, a
 

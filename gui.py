@@ -14,8 +14,8 @@ import customtkinter as ctk
 import requests
 from faster_whisper import WhisperModel, format_timestamp
 
-WHISPER_MODELS = ["medium", "large-v3", "small", "base", "tiny"]
-DEFAULT_WHISPER = "medium"
+WHISPER_MODELS = ["large-v3", "medium", "small", "base", "tiny"]
+DEFAULT_WHISPER = "large-v3"
 
 FREE_MODELS_FALLBACK = [
     "nvidia/nemotron-3-nano-30b-a3b-reasoning:free",
@@ -105,7 +105,7 @@ class App:
         self.video_path = ctk.StringVar(value="video.mp4")
         self.prompt_path = ctk.StringVar(value="prompt.txt")
         self.whisper_model = ctk.StringVar(value=DEFAULT_WHISPER)
-        self.language = ctk.StringVar(value="bn")
+        self.language = ctk.StringVar(value="")
         self.ai_model = ctk.StringVar(value=DEFAULT_MODEL)
         self.status_text = ctk.StringVar(value="Idle")
 
@@ -795,6 +795,8 @@ class App:
             "beam_size": 5,
             "task": "transcribe",
             "vad_filter": True,
+            "vad_parameters": {"min_silence_duration_ms": 700,
+                               "speech_pad_ms": 200},
             "condition_on_previous_text": False,
         }
         if not language:
@@ -807,23 +809,37 @@ class App:
         srt_path = self._project_file("video.srt")
         os.makedirs(os.path.dirname(srt_path), exist_ok=True)
         count = 0
+        dropped = 0
         # Open once, flush as we go: the SRT file survives even if a later
         # segment (or the AI step) fails.
         with open(srt_path, "w", encoding="utf-8") as f:
             try:
                 for i, seg in enumerate(segments, 1):
+                    text = seg.text.strip()
+                    if not text:
+                        continue
+                    # Hallucination guard: music/silence segments have very
+                    # low avg_logprob (real speech is usually > -1.6)
+                    if getattr(seg, "no_speech_prob", 0.0) > 0.6 or \
+                       getattr(seg, "avg_logprob", 0.0) < -2.0:
+                        dropped += 1
+                        continue
+                    # Junk guard: no real letters (punctuation/emoji only)
+                    letters = [ch for ch in text if ch.isalpha()]
+                    if not letters:
+                        dropped += 1
+                        continue
                     start = format_timestamp(seg.start, always_include_hours=True, decimal_marker=",")
                     end = format_timestamp(seg.end, always_include_hours=True, decimal_marker=",")
-                    line = seg.text.strip()
-                    if not line:
-                        continue
-                    f.write(f"{i}\n{start} --> {end}\n{line}\n")
+                    f.write(f"{i}\n{start} --> {end}\n{text}\n")
                     f.flush()
                     count += 1
-                    self.log(f"  [{start} → {end}] {line}", "info")
+                    self.log(f"  [{start} → {end}] {text}", "info")
             except Exception as e:
                 raise RuntimeError(f"Transcription failed at segment {count + 1}: {e}") from e
 
+        if dropped:
+            self.log(f"Skipped {dropped} music/noise segments (hallucination filter).", "info")
         self.log(f"SRT saved  →  {srt_path}  ({count} segments)", "success")
         self.pb.set(0.6)
 

@@ -1,3 +1,7 @@
 faster-whisper
 google-genai
+# ffmpeg 
+# ffprobe 
 customtkinter
+requests
+
